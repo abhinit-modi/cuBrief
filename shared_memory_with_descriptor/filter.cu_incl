@@ -1,0 +1,303 @@
+#include <iostream>
+#include <stdio.h>
+#include <stdlib.h>
+#include <opencv2/core/core.hpp>
+#include <opencv2/highgui/highgui.hpp>
+#include <opencv2/imgproc/imgproc.hpp>
+// #include <opencv2/gpu/gpu.hpp>
+#include <opencv2/cudaarithm.hpp>
+#include <opencv2/opencv.hpp>
+#include <opencv2/features2d.hpp>
+#include <iomanip>
+#include <vector>
+#include <cstdio>
+#include <ctime>
+#include "opencv2/xfeatures2d.hpp"
+#include <opencv2/xfeatures2d/nonfree.hpp>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <cuda_runtime_api.h>
+#include "CycleTimer.h"
+
+
+__device__ float get_ix(float *img, int w, int h, int x, int y)
+{
+    float i_right = 0.0;
+    float i_left = 0.0;
+
+    if ( (x-1) >= 0)
+       i_left = img[(y*w) + x-1];
+     
+    if ( (x+1) < w)
+       i_right = img[(y*w) + x+1];
+
+    return (i_right - i_left) / 2.0;
+
+}
+
+__device__ float get_iy(float *img, int w, int h, int x, int y)
+{
+    float i_up = 0.0;
+    float i_down = 0.0;
+
+    if ( (y-1) >= 0)
+       i_up = img[((y-1)*w) + x];
+
+    if ( (y+1) < h)
+       i_down = img[((y+1)*w) + x];
+
+    return (i_up - i_down) / 2.0;
+}
+
+__device__ float get_curvature(float *img, int w, int h, int x, int y)
+{
+    float dx_left = get_ix(img, w, h, x-1,y);
+    float dx_right = get_ix(img,w, h, x+1,y);
+    float dx_up = get_ix(img, w, h, x,y-1);
+    float dx_down = get_ix(img, w, h, x,y+1);
+
+    float dy_up = get_iy(img, w, h, x,y-1);
+    float dy_down = get_iy(img, w, h, x,y+1);
+
+    float d_xx = (dx_right - dx_left) / 2.0;
+    float d_yy = (dy_up - dy_down) / 2.0;
+    float d_xy = (dx_up - dx_down) / 2.0;
+
+    /* Using Young's theorem Dxy = Dyx */
+    float d_yx = d_xy;
+
+    /* Hessian trace */
+    float trace_h = d_xx + d_yy;
+
+    /* Hessian determinant */
+    float det_h = (d_xx * d_yy) - (d_xy * d_yx);
+
+    /* Compute curature R */
+    float R = (trace_h * trace_h) / det_h;
+
+    return R;
+}
+
+__device__ void copy_3_by_3(float *src, float *dst)
+{
+    memcpy(dst, src, 9 * sizeof(float));
+}
+
+__device__ void get_Dk(float *s1, float *s2, float *d_k)
+{
+    for (int i = 0; i < 9; i++)
+        d_k[i] = s1[i] - s2[i];
+}
+
+
+__device__ float
+get_filter_response(float *img, int w, int h, filter f, int x, int y) 
+{
+    /*int k = f.k;
+    int r = k / 2;
+
+    float sum = 0.0;
+    float tmp = 0.0;
+
+    for (int yy = r*-1; yy <=r; yy++)
+    {
+        // #pragma unroll 2
+        for (int xx = r*-1; xx <= r; xx++)
+        {
+            if ( x+xx <0 || x+xx >= w || y+yy < 0 || y+yy >= h)
+                tmp=0;
+            else
+                tmp = ( (f.h[k * (yy + r) + (xx + r)]) * (img[w * (y + yy) + (x + xx)]));
+            sum += tmp;
+        }
+    }
+
+    return sum;*/
+
+    int k = f.k;
+    int r = k / 2;
+
+    float sum1 = 0.0;
+    float tmp1 = 0.0;
+    float sum2 = 0.0;
+    float tmp2 = 0.0;
+
+    for (int yy = r*-1; yy <=r; yy++)
+    {
+        // #pragma unroll 2
+        int xx;
+        for (xx = r*-1; xx < r; xx+=2)
+        {
+            if ( x+xx <0 || x+xx >= w || y+yy < 0 || y+yy >= h)
+                tmp1=0;
+            else
+                tmp1 = ( (f.h[k * (yy + r) + (xx + r)]) * (img[w * (y + yy) + (x + xx)]));
+
+            sum1 += tmp1;
+
+            if ( x+xx+1 <0 || x+xx+1 >= w || y+yy < 0 || y+yy >= h)
+                tmp2=0;
+            else
+                tmp2 = ( (f.h[k * (yy + r) + (xx + 1 + r)]) * (img[w * (y + yy) + (x + xx + 1)]));
+
+            sum2 += tmp2;
+        }
+
+        if ( x+xx <0 || x+xx >= w || y+yy < 0 || y+yy >= h)
+            sum1+=0;
+        else
+            sum1+=( (f.h[k * (yy + r) + (xx + r)]) * (img[w * (y + yy) + (x + xx)]));
+    }
+
+    return sum1+sum2;
+} 
+
+__device__ float
+get_filter_response_horizontal(float *img, int w, int h, linear_filter f, int x, int y)
+{
+    int k = f.k;
+    int r = k / 2;
+
+    float sum = 0.0;
+    float tmp = 0.0;
+
+    for (int xx = r*-1; xx <= r; xx++)
+    {
+        if ( x+xx <0 || x+xx >= w  || y < 0 || y >= h)
+            continue;
+
+        tmp =  f.hx[xx + r] * img[ (y * w) + (x + xx)];
+
+        sum += tmp;
+    }
+
+    return sum;
+}
+
+__device__ float
+get_filter_response_vertical(float *img, int w, int h, linear_filter f, int x, int y)
+{
+    int k = f.k;
+    int r = k / 2;
+
+    float sum = 0.0;
+    float tmp = 0.0;
+
+    for (int yy = r*-1; yy <= r; yy++)
+    {
+        if ( y + yy <0 || y +yy >= h  || x < 0 || x >= w)
+            continue;
+
+        tmp =  f.hy[yy + r] * img[ ( (y + yy) * w) + x];
+
+        sum += tmp;
+    }
+
+    return sum;
+}
+
+__device__ void square_to_linear(filter f, linear_filter *fl)
+{
+    int k = f.k;
+
+    float total_x = 0.0;
+    float total_y = 0.0;
+
+    /* Compute vertical filter */
+    for (int i = 0; i < k; i++)
+    {
+        fl->hy[i] = f.h[ (i*k) + 0];
+        total_y += fl->hy[i];        
+    }
+
+    /* Compute horizontal filter */
+    for (int i = 0; i < k; i ++)
+    {
+        fl->hx[i] = f.h[ (0*k) + i] / fl->hy[0];
+        total_x += fl->hx[i];
+    }
+
+    /* Normalize */
+    for (int i = 0; i < k; i++)
+        fl->hy[i] /= total_y;
+
+    for (int i = 0; i <k; i++)
+        fl->hx[i] /= total_x;
+
+}
+
+__device__ void get_sk(int k, float *img, float *s, int w, int h, filter f, int x, int y)
+{
+    int r  = k / 2;
+
+    for (int yy = y -1; yy <= y + r; yy++)
+        for (int xx = x - r; xx <= x + r; xx++)
+        {
+            if (xx < 0 || yy < 0 || xx >= w || yy >= h)
+                s[ (yy - y + r) * k + (xx - x + r)] = 0.0;
+            else
+                s[ (yy - y + r) * k + (xx - x + r)] = get_filter_response(img, w, h, f, xx, yy);
+        } 
+}
+
+__device__ void get_dk(int k, float *s1, float *s2, float *dk)
+{
+    int total = k * k;
+
+    for (int i = 0; i < total; i++)
+        dk[i] = s1[i] - s2[i];    
+}
+
+__device__ bool is_max(float *s, float val)
+{
+    for (int i = 0; i < 9; i ++)
+        if (val < s[i])
+            return false;
+
+    return true;
+}
+
+__device__ bool is_min(float *s, float val)
+{
+    for (int i = 0; i < 9; i ++)
+        if (s[i] < val)
+            return false;
+
+    return true;
+}
+
+
+void copy_DoG_bank_device(filter_bank *fb, filter_bank *fbd)
+{
+    int n = fb->n;
+    fbd-> n = n;
+
+    /* Allocate memory for the filter bank */
+    filter *f_temp  = (filter *) malloc(sizeof(filter) * n);
+    filter *f_device;
+
+    cudaMalloc(&f_device, sizeof(filter) * n);
+
+
+    /* Allocate device memory for each filter adn
+       copy to device
+    */
+    for (int i = 0; i < n; i ++)
+    {
+        int k = fb->bank[i].k;
+
+        f_temp[i].k = k;
+
+        float *t;
+        cudaMalloc(&t, sizeof(float) * k * k);
+        f_temp[i].h = t;
+
+
+        cudaMemcpy(t, fb->bank[i].h, sizeof(float) * k * k, cudaMemcpyHostToDevice);
+    }
+
+    cudaMemcpy(f_device,f_temp, sizeof(filter) * n, cudaMemcpyHostToDevice);
+    fbd->bank = f_device;
+}
+
+

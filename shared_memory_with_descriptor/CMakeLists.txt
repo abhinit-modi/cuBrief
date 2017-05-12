@@ -1,0 +1,15 @@
+cmake_minimum_required(VERSION 2.8)
+project( kp )
+find_package( OpenCV REQUIRED )
+find_package( CUDA REQUIRED )
+set(CUDA_ARCH "-arch=sm_50" CACHE STRING "Value of the NVCC -arch option.")
+SET(CUDA_NVCC_FLAGS "${CUDA_NVCC_FLAGS} ${CUDA_ARCH}")
+
+file( GLOB  cu  *.cu *.cpp)
+#add_executable( kp main.cpp )
+include_directories( ${OpenCV_INCLUDE_DIRS} )  
+include_directories( ${CUDA_INCLUDE_DIRS} )
+include_directories( include )
+CUDA_ADD_EXECUTABLE( tester test_dog.cpp dog_cuda.cu dog_serial.cpp filter.cpp )
+target_link_libraries( tester ${CUDA_LIBRARIES} ${OpenCV_LIBS} )
+
