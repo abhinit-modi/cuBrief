@@ -122,7 +122,7 @@ void processUsingCuda(std::string input_file, std::string output_file)
     double end = CycleTimer::currentSeconds();
 
     cout << "took time: " << end-start << endl;
-    drawKeyPoints(input, kp_x_h, kp_y_h, kp_h,"shit_man.jpg");
+    drawKeyPoints(input, kp_x_h, kp_y_h, kp_h,"test_output.jpg");
 }
 
 int main(int argc, char ** argv) 
